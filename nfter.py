@@ -765,7 +765,7 @@ def main_menu():
         print_color("      ② 实现不加密单个端口转发和连续多个端口转发，支持IPv4、IPv6及域名", Colors.CYAN)
         print_color("      ③ 系统级内核转发效率更高", Colors.CYAN)
         print_color("      ④ 支持端口访问限制（IP白名单）", Colors.CYAN)
-        print_color("说明文档：https://github.com/Yorkian/Nfter", Colors.CYAN)
+        print_color("说明文档：https://github.com/utada1stlove/Nfter", Colors.CYAN)
         print_color("=" * 60, Colors.CYAN)
         print()
         print("  1. 添加单端口转发")

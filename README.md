@@ -29,13 +29,13 @@
 
 ```bash
 # 一键安装并运行
-curl -fsSL https://raw.githubusercontent.com/Yorkian/Nfter/main/nfter.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/utada1stlove/Nfter/main/nfter.sh | sudo bash
 
 # 一键安装并运行(中国大陆加速）
-curl -fsSL https://ghproxy.cfd/raw.githubusercontent.com/Yorkian/Nfter/main/nftercn.sh | sudo bash
+curl -fsSL https://ghproxy.cfd/raw.githubusercontent.com/utada1stlove/Nfter/main/nftercn.sh | sudo bash
 
 # 或下载后运行
-wget https://raw.githubusercontent.com/Yorkian/Nfter/main/nfter.sh
+wget https://raw.githubusercontent.com/utada1stlove/Nfter/main/nfter.sh
 sudo bash nfter.sh
 ```
 
@@ -58,7 +58,7 @@ sudo bash nfter.sh
 特点：①采用systemd和配置文件对iptables的替代品nftables进行管理
      ②实现不加密单个端口转发和连续多个端口转发，支持IPv4、IPv6及域名
      ③系统级内核转发效率更高
-说明文档：https://github.com/Yorkian/Nfter
+说明文档：https://github.com/utada1stlove/Nfter
 ============================================================
 
   1. 添加单端口转发

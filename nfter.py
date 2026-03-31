@@ -18,6 +18,7 @@ from datetime import datetime
 # 配置文件路径
 CONFIG_FILE = "/etc/nfter/domains.json"
 ACL_CONFIG_FILE = "/etc/nfter/acl.json"
+QUOTA_CONFIG_FILE = "/etc/nfter/quotas.json"
 PID_FILE = "/var/run/nfter-daemon.pid"
 LOG_FILE = "/var/log/nfter.log"
 
@@ -93,6 +94,48 @@ def format_packets(packets_count):
     elif packets_count < 1000000: return f"{packets_count / 1000:.1f}K"
     else: return f"{packets_count / 1000000:.1f}M"
 
+def parse_size_to_bytes(size_str):
+    if size_str is None:
+        return None
+    normalized = str(size_str).strip().upper().replace("IB", "B")
+    match = re.match(r'^(\d+(?:\.\d+)?)\s*([KMGT]?B)$', normalized)
+    if not match:
+        return None
+    value = float(match.group(1))
+    unit = match.group(2)
+    unit_map = {
+        "B": 1,
+        "KB": 1024,
+        "MB": 1024 * 1024,
+        "GB": 1024 * 1024 * 1024,
+        "TB": 1024 * 1024 * 1024 * 1024
+    }
+    return int(value * unit_map[unit])
+
+def parse_nft_size_to_bytes(value_str, unit_str):
+    unit = unit_str.lower()
+    unit_map = {
+        "byte": 1,
+        "bytes": 1,
+        "kbyte": 1024,
+        "kbytes": 1024,
+        "mbyte": 1024 * 1024,
+        "mbytes": 1024 * 1024,
+        "gbyte": 1024 * 1024 * 1024,
+        "gbytes": 1024 * 1024 * 1024,
+        "tbyte": 1024 * 1024 * 1024 * 1024,
+        "tbytes": 1024 * 1024 * 1024 * 1024
+    }
+    if unit not in unit_map:
+        return 0
+    return int(float(value_str) * unit_map[unit])
+
+def parse_quota_usage(stdout):
+    match = re.search(r'used\s+(\d+(?:\.\d+)?)\s+([a-z]+)', stdout, re.IGNORECASE)
+    if not match:
+        return 0
+    return parse_nft_size_to_bytes(match.group(1), match.group(2))
+
 def run_cmd(cmd, capture=True):
     try:
         result = subprocess.run(cmd, shell=True, capture_output=capture, text=True, timeout=30)
@@ -124,7 +167,7 @@ def init_nat_table():
     os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
 
 def init_filter_table():
-    """初始化 filter 表和链（用于端口访问限制功能）"""
+    """初始化 filter 表和链（用于访问限制和流量额度功能）"""
     for family in ['ip', 'ip6']:
         run_cmd(f"nft add table {family} filter")
         run_cmd(f"nft 'add chain {family} filter input {{ type filter hook input priority 0 ; policy accept ; }}'")
@@ -209,6 +252,20 @@ def save_acl_config(config):
     os.makedirs(os.path.dirname(ACL_CONFIG_FILE), exist_ok=True)
     with open(ACL_CONFIG_FILE, 'w') as f: json.dump(config, f, indent=2)
 
+def load_quota_config():
+    if os.path.exists(QUOTA_CONFIG_FILE):
+        try:
+            with open(QUOTA_CONFIG_FILE, 'r') as f: return json.load(f)
+        except: return {"rules": []}
+    return {"rules": []}
+
+def save_quota_config(config):
+    os.makedirs(os.path.dirname(QUOTA_CONFIG_FILE), exist_ok=True)
+    with open(QUOTA_CONFIG_FILE, 'w') as f: json.dump(config, f, indent=2)
+
+def generate_quota_name():
+    return f"nfter_q_{time.time_ns()}"
+
 def add_mapping_record(domain, current_ip, ip_version, local_port, target_port, protocols, dnat_handles, masq_handles):
     config = load_domain_config()
     mapping = {
@@ -225,6 +282,176 @@ def add_mapping_record(domain, current_ip, ip_version, local_port, target_port, 
     config["mappings"].append(mapping)
     save_domain_config(config)
 
+def get_family_from_version(version):
+    return "ip" if int(version) == 4 else "ip6"
+
+def get_addr_family(version):
+    return "ip" if int(version) == 4 else "ip6"
+
+def get_rule_handle_by_fragments(table, chain, fragments):
+    success, stdout, _ = run_cmd(f"nft -a list chain {table} filter {chain} 2>/dev/null")
+    if not success:
+        return None
+    for line in stdout.splitlines():
+        if not all(fragment in line for fragment in fragments):
+            continue
+        match = re.search(r'handle\s+(\d+)', line)
+        if match:
+            return match.group(1)
+    return None
+
+def quota_matches_rule(record, rule):
+    version = 4 if rule.get("ip_version") == "IPv4" else 6
+    domain = rule.get("domain", "")
+    protocol = rule.get("protocol", "").lower()
+    if protocol not in ["tcp", "udp"]:
+        return False
+    if str(record.get("ip_version")) != str(version):
+        return False
+    if str(record.get("local_port")) != str(rule.get("local_port")):
+        return False
+    if str(record.get("target_port")) != str(rule.get("target_port")):
+        return False
+    if record.get("protocol") != protocol:
+        return False
+    if record.get("domain"):
+        return record.get("domain") == domain
+    return record.get("target_ip") == rule.get("target_ip")
+
+def quota_matches_mapping(record, mapping):
+    mapping_domain = mapping.get("domain", "")
+    if validate_ip(mapping_domain)[0]:
+        mapping_domain = ""
+    if str(record.get("local_port")) != str(mapping.get("local_port")):
+        return False
+    if str(record.get("target_port")) != str(mapping.get("target_port")):
+        return False
+    if record.get("protocol") not in mapping.get("protocols", []):
+        return False
+    if record.get("domain"):
+        return record.get("domain") == mapping_domain
+    return record.get("target_ip") == mapping.get("current_ip") and str(record.get("ip_version")) == str(mapping.get("ip_version"))
+
+def ensure_quota_record_runtime(record):
+    table = get_family_from_version(record.get("ip_version", 4))
+    ensure_filter_chain([(table, int(record.get("ip_version", 4)))])
+    quota_name = record.get("quota_name")
+    limit_bytes = int(record.get("limit_bytes", 0))
+    if not quota_name or limit_bytes <= 0:
+        return False, "额度配置无效"
+
+    success, _, stderr = run_cmd(f"nft add quota {table} filter {quota_name} over {limit_bytes} bytes")
+    if not success and "File exists" not in stderr:
+        return False, stderr
+
+    addr_family = get_addr_family(record.get("ip_version", 4))
+    target_ip = record.get("target_ip")
+    protocol = record.get("protocol")
+    target_port = record.get("target_port")
+    commands = [
+        (
+            f'nft add rule {table} filter forward {addr_family} daddr {target_ip} {protocol} dport {target_port} quota name "{quota_name}" drop',
+            [f"{addr_family} daddr {target_ip}", f"{protocol} dport {target_port}", f'quota name "{quota_name}"'],
+            "to-target"
+        ),
+        (
+            f'nft add rule {table} filter forward {addr_family} saddr {target_ip} {protocol} sport {target_port} quota name "{quota_name}" drop',
+            [f"{addr_family} saddr {target_ip}", f"{protocol} sport {target_port}", f'quota name "{quota_name}"'],
+            "from-target"
+        )
+    ]
+
+    new_handles = []
+    for cmd, fragments, direction in commands:
+        success, _, stderr = run_cmd(cmd)
+        if not success:
+            for handle_meta in new_handles:
+                run_cmd(f'nft delete rule {handle_meta["table"]} filter {handle_meta["chain"]} handle {handle_meta["handle"]} 2>/dev/null')
+            return False, stderr
+        handle = get_rule_handle_by_fragments(table, "forward", fragments)
+        if not handle:
+            for handle_meta in new_handles:
+                run_cmd(f'nft delete rule {handle_meta["table"]} filter {handle_meta["chain"]} handle {handle_meta["handle"]} 2>/dev/null')
+            return False, "额度规则句柄获取失败"
+        new_handles.append({
+            "table": table,
+            "chain": "forward",
+            "direction": direction,
+            "handle": handle
+        })
+
+    record["handles"] = new_handles
+    record["updated_at"] = datetime.now().isoformat()
+    return True, ""
+
+def remove_quota_runtime(record, delete_object=True):
+    for handle_meta in record.get("handles", []):
+        handle = handle_meta.get("handle")
+        table = handle_meta.get("table", get_family_from_version(record.get("ip_version", 4)))
+        chain = handle_meta.get("chain", "forward")
+        if handle:
+            run_cmd(f"nft delete rule {table} filter {chain} handle {handle} 2>/dev/null")
+    record["handles"] = []
+
+    if delete_object and record.get("quota_name"):
+        table = get_family_from_version(record.get("ip_version", 4))
+        run_cmd(f"nft delete quota {table} filter {record['quota_name']} 2>/dev/null")
+
+def remove_quotas_for_mapping(mapping):
+    config = load_quota_config()
+    kept = []
+    removed = 0
+    for record in config.get("rules", []):
+        if quota_matches_mapping(record, mapping):
+            remove_quota_runtime(record, delete_object=True)
+            removed += 1
+        else:
+            kept.append(record)
+    if removed:
+        config["rules"] = kept
+        save_quota_config(config)
+    return removed
+
+def refresh_quotas_for_mapping(mapping, new_ip, new_version):
+    config = load_quota_config()
+    changed = False
+    for record in config.get("rules", []):
+        if not quota_matches_mapping(record, mapping):
+            continue
+        old_table = get_family_from_version(record.get("ip_version", 4))
+        remove_quota_runtime(record, delete_object=False)
+        if str(record.get("ip_version")) != str(new_version):
+            if record.get("quota_name"):
+                run_cmd(f"nft delete quota {old_table} filter {record['quota_name']} 2>/dev/null")
+            record["ip_version"] = int(new_version)
+            run_cmd(f"nft add quota {get_family_from_version(new_version)} filter {record['quota_name']} over {int(record.get('limit_bytes', 0))} bytes")
+        record["target_ip"] = new_ip
+        record["ip_version"] = int(new_version)
+        success, stderr = ensure_quota_record_runtime(record)
+        if not success:
+            print_warning(f"流量额度规则刷新失败 ({record.get('quota_name')}): {stderr}")
+        changed = True
+    if changed:
+        save_quota_config(config)
+
+def remove_all_quota_rules():
+    config = load_quota_config()
+    if not config.get("rules"):
+        return
+    for record in config.get("rules", []):
+        remove_quota_runtime(record, delete_object=True)
+    save_quota_config({"rules": []})
+
+def get_quota_usage(record):
+    table = get_family_from_version(record.get("ip_version", 4))
+    quota_name = record.get("quota_name")
+    if not quota_name:
+        return False, 0
+    success, stdout, _ = run_cmd(f"nft list quota {table} filter {quota_name} 2>/dev/null")
+    if not success:
+        return False, 0
+    return True, parse_quota_usage(stdout)
+
 def remove_mapping_by_handle(handle):
     config = load_domain_config()
     new_mappings = []
@@ -232,6 +459,7 @@ def remove_mapping_by_handle(handle):
     for m in config["mappings"]:
         if handle in m.get("dnat_handles", []) or str(handle) == str(m.get("handle")):
             found = True
+            remove_quotas_for_mapping(m)
             table = "ip" if m.get("ip_version") == 4 else "ip6"
             for h in m.get("dnat_handles", [m.get("handle")]):
                 if h: run_cmd(f"nft delete rule {table} nat prerouting handle {h} 2>/dev/null")
@@ -277,6 +505,7 @@ def update_rule_ip(mapping, new_ip, new_version):
             mm = re.search(r'handle (\d+)', mh_out)
             if mm: new_m_hs.append(mm.group(1))
     
+    refresh_quotas_for_mapping(mapping, new_ip, new_version)
     mapping["dnat_handles"], mapping["masq_handles"] = new_d_hs, new_m_hs
     return len(new_d_hs) > 0
 
@@ -362,10 +591,11 @@ def parse_single_rule(line, version, rid, meta):
 # ==================== 端口访问限制 (IP 白名单) ====================
 
 def ensure_filter_chain(tables):
-    """确保指定 family 的 filter 表和 input 链存在（防御性创建）"""
+    """确保指定 family 的 filter 表以及 input/forward 链存在（防御性创建）"""
     for table, _ in tables:
         run_cmd(f"nft add table {table} filter")
         run_cmd(f"nft 'add chain {table} filter input {{ type filter hook input priority 0 ; policy accept ; }}'")
+        run_cmd(f"nft 'add chain {table} filter forward {{ type filter hook forward priority 0 ; policy accept ; }}'")
 
 def add_acl_rule():
     """添加端口访问限制规则"""
@@ -523,6 +753,164 @@ def acl_menu():
         elif c == '3': delete_acl_rule()
         elif c == '0': return
         
+        input(f"\n{Colors.DIM}按回车键继续...{Colors.ENDC}")
+
+# ==================== 流量额度限制 ====================
+
+def get_quota_status_label(used_bytes, limit_bytes):
+    if used_bytes >= limit_bytes:
+        return "已超限"
+    if limit_bytes <= 0:
+        return "未知"
+    ratio = used_bytes / limit_bytes
+    if ratio >= 0.9:
+        return "接近上限"
+    return "正常"
+
+def list_quota_rules(show_header=True):
+    if show_header:
+        print_header("流量额度限制列表")
+    config = load_quota_config()
+    rules = config.get("rules", [])
+
+    if not rules:
+        print_info("当前没有流量额度限制规则")
+        return []
+
+    headers = ['编号', '协议', '本地端口', '目标', '额度', '已用', '状态']
+    col_w = [6, 6, 12, 20, 12, 12, 10]
+
+    print_color("┌" + "┬".join("─" * w for w in col_w) + "┐", Colors.CYAN)
+    print_color("│" + "│".join(pad_to_width(h, col_w[i]) for i, h in enumerate(headers)) + "│", Colors.CYAN + Colors.BOLD)
+    print_color("├" + "┼".join("─" * w for w in col_w) + "┤", Colors.CYAN)
+
+    for idx, record in enumerate(rules, 1):
+        exists, used_bytes = get_quota_usage(record)
+        target_display = record.get("domain") or record.get("target_ip", "")
+        if len(target_display) > 18:
+            target_display = target_display[:17] + "…"
+        limit_str = format_bytes(record.get("limit_bytes", 0))
+        used_str = format_bytes(used_bytes) if exists else "规则丢失"
+        status = get_quota_status_label(used_bytes, int(record.get("limit_bytes", 0))) if exists else "待修复"
+        print(f"│{pad_to_width(idx, col_w[0])}│{pad_to_width(record.get('protocol', '').upper(), col_w[1])}│{pad_to_width(record.get('local_port', ''), col_w[2])}│{pad_to_width(target_display, col_w[3], 'left')}│{pad_to_width(limit_str, col_w[4])}│{pad_to_width(used_str, col_w[5])}│{pad_to_width(status, col_w[6])}│")
+
+    print_color("└" + "┴".join("─" * w for w in col_w) + "┘", Colors.CYAN)
+    print_info(f"共 {len(rules)} 条流量额度规则")
+    return rules
+
+def add_quota_rule():
+    print_header("添加流量额度限制")
+    print_info("额度会同时统计转发到目标和从目标返回的双向流量，超出后自动丢弃。")
+    rules = parse_forward_rules()
+    if not rules:
+        print_info("请先添加端口转发规则")
+        return
+
+    print_rules_table(rules)
+    idx = get_input("要限制的转发编号", lambda x: x.isdigit() and 1 <= int(x) <= len(rules), f"1-{len(rules)}")
+    if not idx:
+        return
+
+    selected = rules[int(idx) - 1]
+    if selected.get("protocol", "").upper() not in ["TCP", "UDP"]:
+        print_error("当前只支持 TCP 或 UDP 单协议规则")
+        return
+
+    config = load_quota_config()
+    for record in config.get("rules", []):
+        if quota_matches_rule(record, selected):
+            print_warning("这条转发规则已经配置过额度限制")
+            return
+
+    limit_input = get_input("流量上限 (例如 500MB / 10GB)", lambda x: parse_size_to_bytes(x) is not None, "请输入类似 500MB / 10GB 的值")
+    if not limit_input:
+        return
+
+    limit_bytes = parse_size_to_bytes(limit_input)
+    quota_record = {
+        "quota_name": generate_quota_name(),
+        "protocol": selected.get("protocol", "").lower(),
+        "local_port": str(selected.get("local_port")),
+        "target_port": str(selected.get("target_port")),
+        "target_ip": selected.get("target_ip"),
+        "domain": selected.get("domain", ""),
+        "ip_version": 4 if selected.get("ip_version") == "IPv4" else 6,
+        "limit_bytes": int(limit_bytes),
+        "handles": [],
+        "created_at": datetime.now().isoformat(),
+        "updated_at": datetime.now().isoformat()
+    }
+
+    success, stderr = ensure_quota_record_runtime(quota_record)
+    if not success:
+        remove_quota_runtime(quota_record, delete_object=True)
+        print_error(f"流量额度规则添加失败: {stderr}")
+        return
+
+    config["rules"].append(quota_record)
+    save_quota_config(config)
+    print_success(f"已为 {quota_record['protocol'].upper()} / {quota_record['local_port']} 添加 {format_bytes(limit_bytes)} 额度限制")
+    save_rules_prompt()
+
+def reset_quota_rule():
+    print_header("重置流量额度")
+    rules = list_quota_rules(show_header=False)
+    if not rules:
+        return
+
+    idx = get_input("要重置的编号", lambda x: x.isdigit() and 1 <= int(x) <= len(rules), f"1-{len(rules)}")
+    if not idx:
+        return
+
+    record = rules[int(idx) - 1]
+    table = get_family_from_version(record.get("ip_version", 4))
+    success, _, stderr = run_cmd(f"nft reset quota {table} filter {record.get('quota_name')} 2>/dev/null")
+    if success:
+        print_success("流量额度已重置")
+    else:
+        print_error(f"重置失败: {stderr}")
+
+def delete_quota_rule():
+    print_header("删除流量额度限制")
+    config = load_quota_config()
+    rules = config.get("rules", [])
+    if not rules:
+        print_info("当前没有流量额度限制规则")
+        return
+
+    list_quota_rules(show_header=False)
+    idx = get_input("要删除的编号", lambda x: x.isdigit() and 1 <= int(x) <= len(rules), f"1-{len(rules)}")
+    if not idx:
+        return
+
+    record = rules[int(idx) - 1]
+    if input(f"{Colors.RED}确认删除 {record.get('protocol', '').upper()} / {record.get('local_port')} 的流量额度？[y/N]: {Colors.ENDC}").lower() != 'y':
+        return
+
+    remove_quota_runtime(record, delete_object=True)
+    rules.pop(int(idx) - 1)
+    save_quota_config(config)
+    print_success("流量额度规则已删除")
+    save_rules_prompt()
+
+def quota_menu():
+    while True:
+        print_header("流量额度限制")
+        print("  1. 添加额度限制")
+        print("  2. 查看额度列表")
+        print("  3. 重置已用额度")
+        print("  4. 删除额度限制")
+        print("  0. 返回主菜单")
+        print()
+
+        c = input(f"{Colors.CYAN}请选择: {Colors.ENDC}").strip()
+
+        if c == '1': add_quota_rule()
+        elif c == '2': list_quota_rules()
+        elif c == '3': reset_quota_rule()
+        elif c == '4': delete_quota_rule()
+        elif c == '0': return
+
         input(f"\n{Colors.DIM}按回车键继续...{Colors.ENDC}")
 
 # ==================== 核心功能执行 (链式转发修复版) ====================
@@ -727,6 +1115,10 @@ def show_system_status():
     acl_count = len(acl_config.get("rules", []))
     print(f"  访问限制: {acl_count} 条")
 
+    quota_config = load_quota_config()
+    quota_count = len(quota_config.get("rules", []))
+    print(f"  流量额度: {quota_count} 条")
+
 def show_help():
     print_header("使用帮助")
     print("""
@@ -741,6 +1133,7 @@ def show_help():
   2. 范围转发：支持 1:1 端口映射，如 2001-2010 -> 3001-3010
   3. 域名支持：目标地址可使用域名，系统会自动解析并监控 IP 变化
   4. 端口访问限制：可设置 IP 白名单，限制端口只允许特定 IP 访问
+  5. 流量额度限制：按转发规则统计双向流量，超出额度后自动丢弃
 
   【命令行参数】
   nfter daemon    - 以守护进程模式运行（用于域名监控）
@@ -751,6 +1144,7 @@ def show_help():
   【配置文件】
   /etc/nfter/domains.json  - 域名映射配置
   /etc/nfter/acl.json      - 访问限制配置
+  /etc/nfter/quotas.json   - 流量额度配置
   /etc/nftables.conf       - nftables 规则配置
   /var/log/nfter.log       - 运行日志
     """)
@@ -765,6 +1159,7 @@ def main_menu():
         print_color("      ② 实现不加密单个端口转发和连续多个端口转发，支持IPv4、IPv6及域名", Colors.CYAN)
         print_color("      ③ 系统级内核转发效率更高", Colors.CYAN)
         print_color("      ④ 支持端口访问限制（IP白名单）", Colors.CYAN)
+        print_color("      ⑤ 支持按转发规则设置流量额度限制", Colors.CYAN)
         print_color("说明文档：https://github.com/utada1stlove/Nfter", Colors.CYAN)
         print_color("=" * 60, Colors.CYAN)
         print()
@@ -777,6 +1172,7 @@ def main_menu():
         print("  7. 域名监控服务")
         print("  8. 端口访问限制")
         print("  9. 系统状态")
+        print("  10. 流量额度限制")
         print("  h. 帮助")
         print("  0. 退出")
         print()
@@ -790,6 +1186,7 @@ def main_menu():
         elif c == '5':
             if input("输入 'yes' 确认清空: ").lower() == 'yes':
                 run_cmd("nft flush table ip nat"); run_cmd("nft flush table ip6 nat")
+                remove_all_quota_rules()
                 save_domain_config({"mappings": []}); init_nat_table(); print_success("已清空")
         elif c == '6': save_rules()
         elif c == '7':
@@ -800,6 +1197,7 @@ def main_menu():
             elif sub == '3': update_domain_ip(); print_success("域名IP已更新")
         elif c == '8': acl_menu()
         elif c == '9': show_system_status()
+        elif c == '10': quota_menu()
         elif c == 'h' or c == 'H': show_help()
         elif c == '0': sys.exit(0)
         else:
